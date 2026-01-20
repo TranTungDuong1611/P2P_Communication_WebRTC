@@ -66,9 +66,18 @@ class AudioLoopbackTrack(MediaStreamTrack):
         elif sys.platform.startswith("linux"):
             # Linux: Try different ALSA/PulseAudio configurations
             audio_sources = [
+                # PulseAudio (most common on modern Ubuntu)
+                ("default", "pulse", {"sample_rate": "48000"}),
+                ("0", "pulse", {}),
+
+                # ALSA with different device names
                 ("default", "alsa", {"sample_rate": "48000", "channels": "1"}),
-                ("pulse", "pulse", {}),
+                ("hw:0,0", "alsa", {"sample_rate": "48000", "channels": "1"}),
                 ("hw:0", "alsa", {"sample_rate": "48000", "channels": "1"}),
+                ("plughw:0,0", "alsa", {"sample_rate": "48000", "channels": "1"}),
+
+                # Fallback to any available device
+                ("0", "alsa", {}),
             ]
 
             for source, fmt, options in audio_sources:
@@ -79,10 +88,10 @@ class AudioLoopbackTrack(MediaStreamTrack):
                         format=fmt,
                         options=options
                     )
-                    logger.info(f"✅ Successfully initialized audio capture with source: '{source}'")
+                    logger.info(f"✅ Successfully initialized audio capture with source: '{source}' (format: {fmt})")
                     return
                 except Exception as e:
-                    logger.warning(f"Failed with source '{source}': {e}")
+                    logger.warning(f"Failed with source '{source}' format '{fmt}': {e}")
 
         else:
             # Windows
