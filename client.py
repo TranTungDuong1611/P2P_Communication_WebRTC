@@ -35,46 +35,107 @@ class AudioLoopbackTrack(MediaStreamTrack):
 
     def __init__(self):
         super().__init__()
-        # Use system default audio input
-        # On macOS: uses default microphone (empty string or :0)
-        # On Linux: uses ALSA default
-        # On Windows: uses DirectShow default
-        try:
-            if sys.platform == "darwin":
-                # macOS: Use ":0" to select default audio input device
+        self.player = None
+        self._initialize_audio_capture()
+
+    def _initialize_audio_capture(self):
+        """Initialize audio capture with platform-specific settings"""
+        logger.info(f"Initializing audio capture for platform: {sys.platform}")
+
+        if sys.platform == "darwin":
+            # macOS: Try different audio input methods
+            audio_sources = [
+                (":0", {"sample_rate": "48000"}),
+                (":default", {"sample_rate": "48000"}),
+                ("0", {"sample_rate": "48000"}),
+            ]
+
+            for source, options in audio_sources:
+                try:
+                    logger.info(f"Trying macOS audio source: '{source}' with options {options}")
+                    self.player = MediaPlayer(
+                        source,
+                        format="avfoundation",
+                        options=options
+                    )
+                    logger.info(f"✅ Successfully initialized audio capture with source: '{source}'")
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed with source '{source}': {e}")
+
+        elif sys.platform.startswith("linux"):
+            # Linux: Try different ALSA/PulseAudio configurations
+            audio_sources = [
+                ("default", "alsa", {"sample_rate": "48000", "channels": "1"}),
+                ("pulse", "pulse", {}),
+                ("hw:0", "alsa", {"sample_rate": "48000", "channels": "1"}),
+            ]
+
+            for source, fmt, options in audio_sources:
+                try:
+                    logger.info(f"Trying Linux audio source: '{source}' format: '{fmt}' with options {options}")
+                    self.player = MediaPlayer(
+                        source,
+                        format=fmt,
+                        options=options
+                    )
+                    logger.info(f"✅ Successfully initialized audio capture with source: '{source}'")
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed with source '{source}': {e}")
+
+        else:
+            # Windows
+            try:
                 self.player = MediaPlayer(
-                    ":0",
-                    format="avfoundation",
-                    options={"audio_buffer_size": "50"}
+                    "audio=Microphone",
+                    format="dshow"
                 )
-            else:
-                self.player = MediaPlayer(
-                    "default",
-                    format="alsa",
-                    options={"sample_rate": "48000", "channels": "1"}
-                )
-            logger.info("Audio capture initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize audio capture: {e}")
-            logger.info("Will create silent audio track instead")
-            self.player = None
+                logger.info("✅ Successfully initialized audio capture (Windows)")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to initialize Windows audio: {e}")
+
+        logger.error("❌ FAILED to initialize audio capture - will send SILENT audio!")
+        logger.error("Please check:")
+        logger.error("  1. Microphone is connected and working")
+        logger.error("  2. App has microphone permissions")
+        if sys.platform == "darwin":
+            logger.error("  3. macOS: System Preferences → Security & Privacy → Privacy → Microphone")
+        elif sys.platform.startswith("linux"):
+            logger.error("  3. Linux: Run 'arecord -l' to list audio devices")
 
     async def recv(self):
         """Receive audio frame from microphone"""
         if self.player and self.player.audio:
-            frame = await self.player.audio.recv()
-            return frame
-        else:
-            # Generate silent audio frame as fallback
-            await asyncio.sleep(0.02)  # 20ms frame
-            frame = AudioFrame(format="s16", layout="mono", samples=960)
-            for p in frame.planes:
-                p.update(bytes(p.buffer_size))
-            frame.pts = getattr(self, "_timestamp", 0)
-            frame.sample_rate = 48000
-            frame.time_base = "1/48000"
-            self._timestamp = getattr(self, "_timestamp", 0) + 960
-            return frame
+            try:
+                frame = await self.player.audio.recv()
+                # Verify we're actually getting audio data
+                if hasattr(self, '_frame_count'):
+                    self._frame_count += 1
+                else:
+                    self._frame_count = 1
+                    logger.info(f"🎤 Successfully receiving audio from microphone")
+
+                return frame
+            except Exception as e:
+                logger.error(f"Error receiving audio frame: {e}")
+                self.player = None
+
+        # Fallback: Generate silent audio frame
+        if not hasattr(self, '_warned_silent'):
+            logger.warning("⚠️ Sending SILENT audio - microphone not working!")
+            self._warned_silent = True
+
+        await asyncio.sleep(0.02)  # 20ms frame
+        frame = AudioFrame(format="s16", layout="mono", samples=960)
+        for p in frame.planes:
+            p.update(bytes(p.buffer_size))
+        frame.pts = getattr(self, "_timestamp", 0)
+        frame.sample_rate = 48000
+        frame.time_base = "1/48000"
+        self._timestamp = getattr(self, "_timestamp", 0) + 960
+        return frame
 
 
 class WebRTCClient:
@@ -173,57 +234,111 @@ class WebRTCClient:
         async def on_connectionstatechange():
             logger.info(f"Connection state: {self.pc.connectionState}")
             if self.pc.connectionState == "connected":
-                logger.info(" P2P audio connection established!")
+                logger.info("P2P audio connection established!")
 
         @self.pc.on("track")
         async def on_track(track):
             logger.info(f"Received {track.kind} track from peer")
             if track.kind == "audio":
-                logger.info("🔊 Playing incoming audio through speakers...")
+                logger.info("🔊 Setting up audio playback...")
 
-                # Initialize PyAudio for speaker output
-                audio = pyaudio.PyAudio()
-                stream = audio.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=48000,
-                    output=True,
-                    frames_per_buffer=960
-                )
-
-                # Also record to file for verification
+                # Record to file for verification
                 self.recorder = MediaRecorder("received_audio.wav")
                 self.recorder.addTrack(track)
                 await self.recorder.start()
-                logger.info("📝 Recording incoming audio to received_audio.wav")
+                logger.info("📝 Recording to received_audio.wav")
+
+                # Initialize PyAudio for speaker output
+                audio = pyaudio.PyAudio()
+
+                # Log available audio devices for debugging
+                logger.info(f"Available audio devices: {audio.get_device_count()}")
+
+                stream = None
+                try:
+                    stream = audio.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=48000,
+                        output=True,
+                        frames_per_buffer=1024
+                    )
+                    logger.info("✅ Audio output stream opened successfully")
+                except Exception as e:
+                    logger.error(f"Failed to open audio stream: {e}")
+                    # Try with default settings
+                    try:
+                        stream = audio.open(
+                            format=pyaudio.paInt16,
+                            channels=2,  # Stereo
+                            rate=44100,  # Standard CD quality
+                            output=True
+                        )
+                        logger.info("✅ Opened audio stream with default settings (44.1kHz stereo)")
+                    except Exception as e2:
+                        logger.error(f"Failed to open audio stream with defaults: {e2}")
 
                 # Play audio through speakers
                 async def play_audio():
+                    frame_count = 0
                     try:
                         while True:
                             frame = await track.recv()
-                            # Convert audio frame to bytes and play
+                            frame_count += 1
+
+                            if frame_count % 100 == 0:
+                                logger.info(f"Received {frame_count} audio frames")
+
+                            if stream is None:
+                                continue
+
+                            # Get audio data as numpy array
                             audio_data = frame.to_ndarray()
 
-                            # Ensure correct format for PyAudio
-                            if audio_data.dtype != np.int16:
-                                # Normalize float to int16 range
-                                if audio_data.dtype == np.float32 or audio_data.dtype == np.float64:
-                                    audio_data = (audio_data * 32767).astype(np.int16)
-                                else:
-                                    audio_data = audio_data.astype(np.int16)
+                            # Log first frame info for debugging
+                            if frame_count == 1:
+                                logger.info(f"Frame info - dtype: {audio_data.dtype}, shape: {audio_data.shape}, "
+                                          f"rate: {frame.sample_rate}, samples: {frame.samples}")
 
-                            # Flatten if multi-channel
-                            audio_data = audio_data.flatten()
+                            # Convert to int16 format for PyAudio
+                            if audio_data.dtype == np.float32 or audio_data.dtype == np.float64:
+                                # Audio is in float format [-1.0, 1.0], convert to int16
+                                audio_data = np.clip(audio_data, -1.0, 1.0)
+                                audio_data = (audio_data * 32767).astype(np.int16)
+                            elif audio_data.dtype != np.int16:
+                                audio_data = audio_data.astype(np.int16)
 
-                            # Play through speakers
-                            stream.write(audio_data.tobytes())
+                            # Handle channel layout
+                            if len(audio_data.shape) == 2:
+                                # Multi-channel, convert to mono or handle appropriately
+                                if stream._channels == 1:
+                                    audio_data = audio_data.mean(axis=1).astype(np.int16)
+                                elif stream._channels == 2 and audio_data.shape[1] == 1:
+                                    # Mono to stereo
+                                    audio_data = np.repeat(audio_data, 2, axis=1)
+                            else:
+                                # Single channel
+                                if stream._channels == 2:
+                                    # Duplicate mono to stereo
+                                    audio_data = np.column_stack([audio_data, audio_data])
+
+                            # Ensure contiguous array
+                            audio_data = np.ascontiguousarray(audio_data)
+
+                            # Write to audio output
+                            try:
+                                stream.write(audio_data.tobytes(), exception_on_underflow=False)
+                            except Exception as e:
+                                if frame_count % 50 == 0:
+                                    logger.warning(f"Audio write error: {e}")
 
                     except Exception as e:
                         logger.info(f"Audio playback ended: {e}")
                     finally:
-                        stream.stop_stream()
-                        stream.close()
+                        logger.info(f"Total frames received: {frame_count}")
+                        if stream:
+                            stream.stop_stream()
+                            stream.close()
                         audio.terminate()
 
                 asyncio.create_task(play_audio())
